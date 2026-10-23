@@ -1,0 +1,2166 @@
+==> app.R <==
+# ============================================================
+# app.R
+# Интерактивное веб-приложение для анализа судебных решений
+# по теме "Видеонаблюдение в школе" (с паттернами)
+# ============================================================
+
+library(shiny)
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(readr)
+library(stringr)
+library(tidyr)
+
+# --- Загрузка данных ---
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+df <- read_csv(file.path(BASE_DIR, "data", "cases_features.csv"), show_col_types = FALSE)
+
+# Фильтрация валидных данных
+df <- df %>%
+  filter(
+    text_length > 5000,
+    !is.na(case_type),
+    !str_detect(case_type, "Не определено"),
+    !is.na(duration),
+    duration > 0,
+    duration < 365
+  )
+
+# Максимальное число нарушений для ползунка (защита от NA)
+max_viol <- max(df$n_violations, na.rm = TRUE)
+if (is.na(max_viol)) max_viol <- 1
+
+# ============================================================
+# UI (Интерфейс)
+# ============================================================
+ui <- fluidPage(
+  titlePanel("Анализ судебных решений: Видеонаблюдение в школах"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      h4("Фильтры"),
+      
+      selectInput("district", "Федеральный округ:",
+                  choices = c("Все округа" = "ALL", sort(unique(df$district))),
+                  selected = "ALL"),
+      
+      selectInput("case_type", "Тип дела:",
+                  choices = c("Все типы" = "ALL", sort(unique(df$case_type))),
+                  selected = "ALL"),
+      
+      selectInput("pattern", "Ключевой паттерн:",
+                  choices = c("Все паттерны" = "ALL",
+                              "Использование как доказательство" = "pat_evidence",
+                              "Нарушение хранения" = "pat_storage",
+                              "Отсутствие камер" = "pat_absence_camera",
+                              "Нарушение СанПиН" = "pat_violation_sanpin",
+                              "Утечка данных" = "pat_data_leak",
+                              "Неисправность" = "pat_malfunction"),
+                  selected = "ALL"),
+      
+      sliderInput("duration", "Длительность рассмотрения (дни):",
+                  min = 0, max = 365, value = c(0, 365)),
+      
+      sliderInput("n_violations", "Количество нарушений в деле:",
+                  min = 0, max = max_viol, value = c(0, max_viol), step = 1),
+      
+      checkboxInput("only_children", "Только дела с упоминанием детей", FALSE),
+      checkboxInput("only_incident", "Только дела с упоминанием инцидентов", FALSE),
+      
+      hr(),
+      p(strong("Всего наблюдений:"), nrow(df))
+    ),
+    
+    mainPanel(
+      width = 9,
+      tabsetPanel(
+        tabPanel("Обзор",
+                 h3("Ключевые метрики"),
+                 fluidRow(
+                   column(2, wellPanel(
+                     h4(textOutput("total_cases")),
+                     p("Всего дел", style="font-size:12px;")
+                   )),
+                   column(2, wellPanel(
+                     h4(textOutput("avg_duration")),
+                     p("Ср. длительность", style="font-size:12px;")
+                   )),
+                   column(2, wellPanel(
+                     h4(textOutput("avg_violations")),
+                     p("Ср. нарушений", style="font-size:12px;")
+                   )),
+                   column(3, wellPanel(
+                     h4(textOutput("children_pct")),
+                     p("Доля с детьми", style="font-size:12px;")
+                   )),
+                   column(3, wellPanel(
+                     h4(textOutput("violations_pct")),
+                     p("Доля с нарушениями", style="font-size:12px;")
+                   ))
+                 ),
+                 
+                 h3("Распределение длительности"),
+                 plotOutput("hist_duration", height = "350px"),
+                 
+                 fluidRow(
+                   column(6, 
+                          h3("Типы судебных дел"),
+                          plotOutput("bar_case_types", height = "350px")
+                   ),
+                   column(6,
+                          h3("Частота паттернов"),
+                          plotOutput("bar_patterns", height = "350px")
+                   )
+                 )
+        ),
+        
+        tabPanel("География",
+                 h3("Длительность по федеральным округам"),
+                 plotOutput("box_districts", height = "500px")
+        ),
+        
+        tabPanel("Тематики",
+                 h3("Упоминания ключевых тем"),
+                 plotOutput("keywords", height = "400px")
+        ),
+        
+        tabPanel("Таблица данных",
+                 h3("Детальная информация по делам"),
+                 DTOutput("data_table")
+        )
+      )
+    )
+  )
+)
+
+# ============================================================
+# Server (Логика)
+# ============================================================
+server <- function(input, output, session) {
+  
+  # Реактивный фильтр данных
+  filtered_data <- reactive({
+    d <- df
+    
+    if (input$district != "ALL") {
+      d <- d %>% filter(district == input$district)
+    }
+    
+    if (input$case_type != "ALL") {
+      d <- d %>% filter(case_type == input$case_type)
+    }
+    
+    # Фильтрация по выбранному паттерну
+    if (input$pattern != "ALL") {
+      # .data[[input$pattern]] позволяет динамически обращаться к колонке по её имени
+      d <- d %>% filter(.data[[input$pattern]] == TRUE)
+    }
+    
+    d <- d %>% filter(duration >= input$duration[1] & duration <= input$duration[2])
+    
+    d <- d %>% filter(n_violations >= input$n_violations[1] & n_violations <= input$n_violations[2])
+    
+    if (input$only_children) {
+      d <- d %>% filter(kw_children == TRUE)
+    }
+    
+    if (input$only_incident) {
+      d <- d %>% filter(kw_incident == TRUE)
+    }
+    
+    d
+  })
+  
+  # Ключевые метрики
+  output$total_cases <- renderText({
+    nrow(filtered_data())
+  })
+  
+  output$avg_duration <- renderText({
+    sprintf("%.1f", mean(filtered_data()$duration, na.rm = TRUE))
+  })
+  
+  output$avg_violations <- renderText({
+    sprintf("%.1f", mean(filtered_data()$n_violations, na.rm = TRUE))
+  })
+  
+  output$children_pct <- renderText({
+    pct <- mean(filtered_data()$kw_children, na.rm = TRUE) * 100
+    sprintf("%.1f%%", pct)
+  })
+  
+  output$violations_pct <- renderText({
+    pct <- mean(filtered_data()$n_violations > 0, na.rm = TRUE) * 100
+    sprintf("%.1f%%", pct)
+  })
+  
+  # Гистограмма длительности
+  output$hist_duration <- renderPlot({
+    ggplot(filtered_data(), aes(x = duration)) +
+      geom_histogram(binwidth = 10, fill = "steelblue", color = "white", alpha = 0.85) +
+      labs(title = "Распределение длительности рассмотрения дел",
+           x = "Длительность (дни)", y = "Количество дел") +
+      theme_minimal(base_size = 14)
+  })
+  
+  # Столбчатая диаграмма типов дел
+  output$bar_case_types <- renderPlot({
+    type_data <- filtered_data() %>% count(case_type)
+    ggplot(type_data, aes(x = reorder(case_type, -n), y = n)) +
+      geom_col(fill = "coral", alpha = 0.85) +
+      labs(title = "Распределение по типам", x = NULL, y = "Количество дел") +
+      theme_minimal(base_size = 14) +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  })
+  
+  # График паттернов
+  output$bar_patterns <- renderPlot({
+    pat_summary <- tibble(
+      "Доказательства" = sum(filtered_data()$pat_evidence, na.rm = TRUE),
+      "Хранение" = sum(filtered_data()$pat_storage, na.rm = TRUE),
+      "Нет камер" = sum(filtered_data()$pat_absence_camera, na.rm = TRUE),
+      "СанПиН" = sum(filtered_data()$pat_violation_sanpin, na.rm = TRUE),
+      "Утечка" = sum(filtered_data()$pat_data_leak, na.rm = TRUE),
+      "Неисправность" = sum(filtered_data()$pat_malfunction, na.rm = TRUE)
+    ) %>% pivot_longer(everything(), names_to = "Паттерн", values_to = "Количество")
+    
+    ggplot(pat_summary, aes(x = reorder(Паттерн, -Количество), y = Количество)) +
+      geom_col(fill = "darkorange", alpha = 0.85) +
+      labs(title = "Паттерны нарушений", x = NULL, y = "Количество дел") +
+      theme_minimal(base_size = 14) +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  })
+  
+  # Boxplot по округам
+  output$box_districts <- renderPlot({
+    ggplot(filtered_data(), aes(x = reorder(district, duration, FUN = median),
+                                y = duration, fill = district)) +
+      geom_boxplot(alpha = 0.8) +
+      coord_flip() +
+      labs(title = "Длительность по округам", x = NULL, y = "Дни") +
+      theme_minimal(base_size = 14) +
+      guides(fill = "none")
+  })
+  
+  # Ключевые темы
+  output$keywords <- renderPlot({
+    kw_summary <- tibble(
+      "Видеонаблюдение" = sum(filtered_data()$kw_camera, na.rm = TRUE),
+      "Школа" = sum(filtered_data()$kw_school, na.rm = TRUE),
+      "Дети" = sum(filtered_data()$kw_children, na.rm = TRUE),
+      "Инциденты" = sum(filtered_data()$kw_incident, na.rm = TRUE),
+      "Отсутствие" = sum(filtered_data()$kw_absence, na.rm = TRUE),
+      "Обязательства" = sum(filtered_data()$kw_obligate, na.rm = TRUE)
+    ) %>% pivot_longer(everything(), names_to = "Тема", values_to = "Количество")
+    
+    ggplot(kw_summary, aes(x = reorder(Тема, -Количество), y = Количество)) +
+      geom_col(fill = "seagreen3", alpha = 0.85) +
+      labs(title = "Ключевые темы (слова)", x = NULL, y = "Количество дел") +
+      theme_minimal(base_size = 14) +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  })
+  
+  # Таблица данных
+  output$data_table <- renderDT({
+    datatable(
+      filtered_data() %>%
+        select(id, district, court, case_type, date_in, date_out, duration, n_violations, 
+               pat_evidence, pat_storage, pat_absence_camera) %>%
+        mutate(
+          date_in = format(date_in, "%d.%m.%Y"),
+          date_out = format(date_out, "%d.%m.%Y")
+        ),
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE
+    ) %>%
+      formatStyle('duration', backgroundColor = styleInterval(
+        c(30, 60), c('white', 'lightyellow', 'lightblue')
+      )) %>%
+      formatStyle('n_violations', backgroundColor = styleInterval(
+        c(0, 2), c('white', 'lightyellow', 'lightsalmon')
+      ))
+  })
+}
+
+# Запуск приложения
+shinyApp(ui, server)
+==> eda.R <==
+# ============================================================
+# eda.R — Разведочный анализ данных (с паттернами правонарушений)
+# ============================================================
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(ggplot2)
+  library(tidyr); library(stringr)
+})
+
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+df <- read_csv(file.path(BASE_DIR, "data", "cases_features.csv"), show_col_types = FALSE)
+
+cat(sprintf("Загружено %d строк из cases_features.csv\n", nrow(df)))
+
+# Приводим is_valid к логическому типу
+if ("is_valid" %in% colnames(df)) {
+  df$is_valid <- as.logical(df$is_valid)
+} else {
+  df$is_valid <- TRUE
+  cat("Колонка 'is_valid' не найдена, считаем все файлы валидными.\n")
+}
+
+# Фильтруем: только валидные файлы и дела с определённым типом
+df <- df %>%
+  filter(
+    is_valid == TRUE,
+    !str_detect(case_type, "Не определено")
+  )
+
+cat(sprintf("После фильтрации осталось %d наблюдений из 625\n", nrow(df)))
+
+# --- Определяем колонки паттернов (все, что начинаются на pat_) ---
+pattern_cols <- grep("^pat_", colnames(df), value = TRUE)
+if (length(pattern_cols) == 0) {
+  warning("Колонки паттернов (pat_*) не найдены. Проверьте extract_features.R")
+} else {
+  cat(sprintf("Найдено %d паттернов: %s\n", length(pattern_cols), paste(pattern_cols, collapse=", ")))
+}
+
+# ============================================================
+# 1. Описательная статистика
+# ============================================================
+summary(df)
+
+cat("\nРаспределение по округам:\n")
+df %>% count(district, sort = TRUE) %>% print()
+
+cat("\nРаспределение по типам дел:\n")
+df %>% count(case_type, sort = TRUE) %>% print()
+
+cat("\nДлительность рассмотрения (дни):\n")
+df %>% summarise(
+  mean   = mean(duration, na.rm = TRUE),
+  median = median(duration, na.rm = TRUE),
+  sd     = sd(duration, na.rm = TRUE),
+  min    = min(duration, na.rm = TRUE),
+  max    = max(duration, na.rm = TRUE)
+) %>% print()
+
+# --- Статистика по паттернам правонарушений ---
+if (length(pattern_cols) > 0) {
+  cat("\nРаспределение паттернов правонарушений:\n")
+  pattern_summary <- df %>%
+    summarise(across(all_of(pattern_cols), ~ sum(.x, na.rm = TRUE))) %>%
+    pivot_longer(everything(), names_to = "Паттерн", values_to = "Количество") %>%
+    mutate(Доля = round(Количество / nrow(df) * 100, 1))
+  print(pattern_summary)
+}
+
+# ============================================================
+# Функция-генератор графиков (сохраняет в подпапку внутри eda_plots)
+# ============================================================
+plot_and_save <- function(data, base_dir, folder_name) {
+  save_dir <- file.path(base_dir, folder_name)
+  dir.create(save_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  if (nrow(data) == 0) {
+    cat(sprintf("  [Пропуск] %s: нет данных для графиков\n", folder_name))
+    return(invisible())
+  }
+  
+  cat(sprintf("  -> Генерация графиков для: %s (папка: %s)\n", folder_name, save_dir))
+  
+  custom_theme <- theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major = element_line(color = "grey70", linewidth = 0.5),
+      panel.grid.minor = element_line(color = "grey85", linewidth = 0.25, linetype = "dashed"),
+      panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.8)
+    )
+  
+  # --- 1. Гистограмма длительности ---
+  dur_data <- data %>% filter(!is.na(duration), duration < 365)
+  if (nrow(dur_data) > 0) {
+    max_dur <- max(dur_data$duration, na.rm = TRUE)
+    step <- ifelse(max_dur <= 50, 5, ifelse(max_dur <= 150, 10, 20))
+    
+    p1 <- ggplot(dur_data, aes(x = duration)) +
+      geom_histogram(binwidth = step, fill = "steelblue", color = "white", alpha = 0.85) +
+      scale_x_continuous(breaks = seq(0, max_dur + step, by = step)) +
+      labs(title = paste0(folder_name, ": Длительность рассмотрения дел"),
+           x = "Дни", y = "Количество дел") + 
+      custom_theme
+    
+    print(p1)
+    ggsave(file.path(save_dir, "hist_duration.png"), p1, width = 8, height = 5, dpi = 150)
+  }
+  
+  # --- 2. Столбчатая диаграмма типов дел ---
+  type_data <- data %>% 
+    count(case_type) %>%
+    filter(!is.na(case_type), 
+           !str_detect(case_type, "Не определено|ошибка загрузки|файл обрезан"))
+  
+  if (nrow(type_data) > 0) {
+    max_n <- max(type_data$n, na.rm = TRUE)
+    step_n <- ifelse(max_n <= 20, 2, ifelse(max_n <= 100, 10, 25))
+    
+    p2 <- ggplot(type_data, aes(x = reorder(case_type, -n), y = n)) +
+      geom_col(fill = "coral", alpha = 0.85) +
+      scale_y_continuous(breaks = seq(0, max_n + step_n, by = step_n)) +
+      labs(title = paste0(folder_name, ": Типы судебных дел"), x = NULL, y = "Количество") +
+      custom_theme + 
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+    
+    print(p2)
+    ggsave(file.path(save_dir, "bar_case_types.png"), p2, width = 8, height = 5, dpi = 150)
+  }
+  
+  # --- 3. Boxplot по округам (только для ALL) ---
+  if (folder_name == "ALL" && length(unique(data$district)) > 1) {
+    box_data <- data %>% filter(!is.na(duration), duration < 365)
+    if (nrow(box_data) > 0) {
+      max_dur <- max(box_data$duration, na.rm = TRUE)
+      step <- ifelse(max_dur <= 50, 5, ifelse(max_dur <= 150, 10, 20))
+      
+      p3 <- ggplot(box_data, aes(x = reorder(district, duration, FUN = median), 
+                                 y = duration, fill = district)) +
+        geom_boxplot(alpha = 0.8) + 
+        scale_y_continuous(breaks = seq(0, max_dur + step, by = step)) +
+        coord_flip() + 
+        guides(fill = "none") +
+        labs(title = "Сравнение длительности по федеральным округам", 
+             x = NULL, y = "Дни") + 
+        custom_theme
+      
+      print(p3)
+      ggsave(file.path(save_dir, "box_districts.png"), p3, width = 9, height = 6, dpi = 150)
+    }
+  }
+  
+  # --- 4. Распределение по ключевым словам ---
+  kw_summary <- tibble(
+    "Видеонаблюдение" = sum(data$kw_camera, na.rm = TRUE),
+    "Школа/Образование" = sum(data$kw_school, na.rm = TRUE),
+    "Дети/Несовершеннолетние" = sum(data$kw_children, na.rm = TRUE),
+    "Инциденты" = sum(data$kw_incident, na.rm = TRUE),
+    "Отсутствие оснащения" = sum(data$kw_absence, na.rm = TRUE),
+    "Обязательные требования" = sum(data$kw_obligate, na.rm = TRUE)
+  ) %>% pivot_longer(everything(), names_to = "Категория", values_to = "Количество")
+  
+  if (sum(kw_summary$Количество) > 0) {
+    max_kw <- max(kw_summary$Количество, na.rm = TRUE)
+    step_kw <- ifelse(max_kw <= 20, 2, ifelse(max_kw <= 100, 10, 25))
+    
+    p5 <- ggplot(kw_summary, aes(x = reorder(Категория, -Количество), y = Количество)) +
+      geom_col(fill = "seagreen3", alpha = 0.85) +
+      scale_y_continuous(breaks = seq(0, max_kw + step_kw, by = step_kw)) +
+      labs(title = paste0(folder_name, ": Упоминания ключевых тем"), x = NULL, y = "Количество дел") +
+      custom_theme +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+    
+    print(p5)
+    ggsave(file.path(save_dir, "keywords.png"), p5, width = 9, height = 5, dpi = 150)
+  }
+  
+  # --- 5. Распределение паттернов правонарушений ---
+  if (length(pattern_cols) > 0) {
+    pat_data <- data %>%
+      summarise(across(all_of(pattern_cols), ~ sum(.x, na.rm = TRUE))) %>%
+      pivot_longer(everything(), names_to = "Паттерн", values_to = "Количество") %>%
+      filter(Количество > 0)
+    
+    if (nrow(pat_data) > 0) {
+      max_pat <- max(pat_data$Количество, na.rm = TRUE)
+      step_pat <- ifelse(max_pat <= 20, 2, ifelse(max_pat <= 100, 10, 25))
+      
+      p6 <- ggplot(pat_data, aes(x = reorder(Паттерн, -Количество), y = Количество)) +
+        geom_col(fill = "darkorange", alpha = 0.85) +
+        scale_y_continuous(breaks = seq(0, max_pat + step_pat, by = step_pat)) +
+        labs(title = paste0(folder_name, ": Паттерны правонарушений"), x = NULL, y = "Количество дел") +
+        custom_theme +
+        theme(axis.text.x = element_text(angle = 30, hjust = 1))
+      
+      print(p6)
+      ggsave(file.path(save_dir, "patterns.png"), p6, width = 10, height = 5, dpi = 150)
+    }
+  }
+  
+  # --- 6. Тепловая карта: регион × паттерн (только для ALL) ---
+  if (folder_name == "ALL" && length(pattern_cols) > 0 && length(unique(data$district)) > 1) {
+    heat_data <- data %>%
+      group_by(district) %>%
+      summarise(across(all_of(pattern_cols), ~ mean(.x, na.rm = TRUE) * 100)) %>%
+      pivot_longer(-district, names_to = "Паттерн", values_to = "Процент")
+    
+    p7 <- ggplot(heat_data, aes(x = Паттерн, y = district, fill = Процент)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = sprintf("%.0f%%", Процент)), size = 3) +
+      scale_fill_gradient(low = "white", high = "red") +
+      labs(title = "Доля дел с паттерном по федеральным округам, %", x = NULL, y = NULL) +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+    
+    print(p7)
+    ggsave(file.path(save_dir, "heatmap_patterns.png"), p7, width = 10, height = 6, dpi = 150)
+  }
+}
+
+# ============================================================
+# 1. Генерация ОБЩИХ графиков по всей базе папка eda_plots/ALL/
+# ============================================================
+cat("\n=== Построение общих графиков ===\n")
+plot_and_save(df, 
+              base_dir = file.path(BASE_DIR, "eda_plots"), 
+              folder_name = "ALL")
+
+# --- Матрица корреляций (сохраняем в папку ALL) ---
+# Включаем паттерны, если они есть
+cor_vars <- c("duration", "text_length", "n_camera", "n_kamera", "n_school", "n_children")
+if (length(pattern_cols) > 0) {
+  cor_vars <- c(cor_vars, pattern_cols)
+}
+
+num_vars <- df %>%
+  select(all_of(cor_vars)) %>%
+  mutate(across(all_of(pattern_cols), as.numeric)) %>%
+  cor(use = "pairwise.complete.obs")
+
+print(round(num_vars, 2))
+
+if (requireNamespace("reshape2", quietly = TRUE)) {
+  melted <- reshape2::melt(num_vars)
+  p4 <- ggplot(melted, aes(Var1, Var2, fill = value)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(value, 2)), size = 3.5) +
+    scale_fill_gradient2(low = "red", mid = "white", high = "steelblue", midpoint = 0) +
+    labs(title = "Матрица корреляций признаков (включая паттерны)", x = NULL, y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+  print(p4)
+  ggsave(file.path(BASE_DIR, "eda_plots", "ALL", "corr_matrix.png"), 
+         p4, width = 10, height = 8, dpi = 150)
+}
+
+# ============================================================
+# 2. Генерация графиков ДЛЯ КАЖДОГО ОКРУГА, папка eda_plots/Имя_Округа/
+# ============================================================
+cat("\n=== Построение графиков по округам ===\n")
+for (dist in unique(df$district)) {
+  df_dist <- df %>% filter(district == dist)
+  plot_and_save(df_dist, 
+                base_dir = file.path(BASE_DIR, "eda_plots"), 
+                folder_name = dist)
+}
+
+# ============================================================
+# Функция: доля дел с паттерном по федеральным округам (%)
+# Возвращает таблицу, печатает копируемый TSV и сохраняет CSV
+# ============================================================
+pattern_share_by_district <- function(data,
+                                      base_dir = BASE_DIR,
+                                      pattern_cols = NULL,
+                                      save_csv = TRUE,
+                                      round_digits = 1) {
+  # Если паттерны не переданы — берём все колонки, начинающиеся на pat_
+  if (is.null(pattern_cols)) {
+    pattern_cols <- grep("^pat_", colnames(data), value = TRUE)
+  }
+  if (length(pattern_cols) == 0) {
+    warning("Колонки паттернов (pat_*) не найдены.")
+    return(invisible(NULL))
+  }
+  
+  # Считаем долю (в %) по каждому округу, плюс строку ALL (вся база)
+  shares <- data %>%
+    group_by(district) %>%
+    summarise(
+      n_cases = n(),
+      across(all_of(pattern_cols), ~ round(mean(.x, na.rm = TRUE) * 100, round_digits)),
+      .groups = "drop"
+    )
+  
+  shares_all <- data %>%
+    summarise(
+      district = "ALL",
+      n_cases = n(),
+      across(all_of(pattern_cols), ~ round(mean(.x, na.rm = TRUE) * 100, round_digits))
+    )
+  
+  result <- bind_rows(shares, shares_all)
+  
+  # --- Печать копируемой таблицы (TSV: разделитель — табуляция) ---
+  cat("\n=== Доля дел с паттерном по федеральным округам, % ===\n")
+  cat("(скопируйте и вставьте в Excel — разделитель табуляции)\n\n")
+  
+  # Заголовок
+  cat(paste(colnames(result), collapse = "\t"), "\n", sep = "")
+  # Строки
+  for (i in seq_len(nrow(result))) {
+    cat(paste(unlist(result[i, ]), collapse = "\t"), "\n", sep = "")
+  }
+  cat("\n")
+  
+  # --- Сохранение в CSV ---
+  if (save_csv) {
+    out_path <- file.path(base_dir, "data", "pattern_share_by_district.csv")
+    dir.create(dirname(out_path), showWarnings = FALSE, recursive = TRUE)
+    readr::write_csv(result, out_path)
+    cat(sprintf("CSV сохранён: %s\n", out_path))
+  }
+  
+  invisible(result)
+}
+
+pattern_share_by_district(df)
+cat("\nВсе графики сохранены в папку 'eda_plots' с разбивкой по подпапкам!\n")
+==> extract_features.R <==
+# ============================================================
+# extract_features.R
+# Извлекает признаки из скачанных HTML-решений в единый CSV
+# Надежное извлечение дат и суда, сохранение ID
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(rvest)
+  library(stringr)
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
+  library(readr)
+})
+
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+
+# --- Читаем CSV с релевантными ID ---
+csv_path <- file.path(BASE_DIR, "data", "relevant_cases_with_type_and_case_ending.csv")
+relevant_df <- read_csv(csv_path, show_col_types = FALSE)
+relevant_ids <- as.character(relevant_df$ID)
+relevant_ids <- trimws(relevant_ids)
+relevant_ids <- str_remove(relevant_ids, "\\.0$")
+cat(sprintf("Загружено %d релевантных ID из CSV\n", length(relevant_ids)))
+
+# --- Ищем папки округов (они лежат в подпапке data) ---
+data_dir <- file.path(BASE_DIR, "data")
+folders <- list.dirs(data_dir, recursive = FALSE)
+folders <- folders[str_detect(basename(folders), "_Videonablyudenie_v_skole$")]
+
+# --- Ищем файлы по именам (ID.html) в папках округов ---
+html_files <- unlist(lapply(folders, function(f) {
+  expected_files <- file.path(f, paste0(relevant_ids, ".html"))
+  existing_files <- expected_files[file.exists(expected_files)]
+  return(existing_files)
+}))
+
+cat(sprintf("Найдено HTML-файлов для обработки: %d из %d\n", length(html_files), length(relevant_ids)))
+
+# --- Проверка: есть ли файлы вообще ---
+if (length(html_files) == 0) {
+  stop("Не найдено ни одного HTML-файла. Проверьте:\n",
+       "1. Правильность BASE_DIR (сейчас: ", BASE_DIR, ")\n",
+       "2. Что внутри папок округов лежат файлы вида 'ID.html'")
+}
+
+# --- Проверка первых 3 ID ---
+if (length(relevant_ids) >= 3) {
+  first_3_ids <- relevant_ids[1:3]
+  found_ids <- tools::file_path_sans_ext(basename(html_files))
+  found_count <- sum(first_3_ids %in% found_ids)
+  if (found_count == 0) {
+    stop("КРИТИЧЕСКАЯ ОШИБКА: Первые 3 ID из CSV не найдены в папках округов.\n",
+         "Проверенные ID: ", paste(first_3_ids, collapse = ", "))
+  }
+}
+
+# 12/10/26 Полное изменение html файлов! Дела нужно парсить иначе!
+# extract_one <- function(path) {
+#   district <- basename(dirname(path)) %>%
+#     str_remove("_Videonablyudenie_v_skole$")
+#   cid <- tools::file_path_sans_ext(basename(path))
+#   
+#   html <- tryCatch(read_html(path, encoding = "UTF-8"), error = function(e) NULL)
+#   if (is.null(html)) return(NULL)
+#   
+#   text <- html %>% html_text2()
+#   text_lower <- tolower(text)
+#   text_length <- nchar(text)
+#   
+#   # Оболочка / битый файл
+#   if (text_length < 3000) {
+#     meta_desc <- html %>% html_node("meta[name='description']") %>% html_attr("content")
+#     return(tibble(
+#       id = cid, district = district, is_valid = FALSE,
+#       court = ifelse(!is.na(meta_desc), str_extract(meta_desc, "^[^,]+"), "Не найден"),
+#       case_type = "Не определено (файл обрезан)",
+#       date_in = NA_character_,
+#       date_out = str_extract(meta_desc, "\\d{2}\\.\\d{2}\\.\\d{4}"),
+#       text_length = text_length,
+#       kw_camera = FALSE, kw_school = FALSE, kw_children = FALSE,
+#       kw_incident = FALSE, kw_absence = FALSE, kw_obligate = FALSE,
+#       n_camera = 0, n_kamera = 0, n_school = 0, n_children = 0
+#     ))
+#   }
+#   
+#   # Суд
+#   court_match <- str_match(text, "Суд:\\s*(.+)")
+#   court <- if (!is.na(court_match[1, 1])) str_trim(court_match[1, 2]) else "Не найден"
+#   
+#   # Даты
+#   date_in_match <- str_match(text, "Дата начала:\\s*(\\d{2}\\.\\d{2}\\.\\d{4})")
+#   date_in <- if (!is.na(date_in_match[1, 1])) date_in_match[1, 2] else NA_character_
+#   
+#   date_out_match <- str_match(text, "Дата рассмотрения:\\s*(\\d{2}\\.\\d{2}\\.\\d{4})")
+#   date_out <- if (!is.na(date_out_match[1, 1])) date_out_match[1, 2] else NA_character_
+#   
+#   if (is.na(date_out)) {
+#     m_out <- str_match(text, "(?:изготовлен|вынесен|принят|опубликован).*?(\\d{1,2})\\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\\s+(\\d{4})")
+#     if (!is.na(m_out[1, 1])) {
+#       day <- m_out[1, 2]
+#       month_str <- m_out[1, 3]
+#       year <- m_out[1, 4]
+#       month_num <- switch(month_str,
+#                           "января" = "01", "февраля" = "02", "марта" = "03", "апреля" = "04",
+#                           "мая" = "05", "июня" = "06", "июля" = "07", "августа" = "08",
+#                           "сентября" = "09", "октября" = "10", "ноября" = "11", "декабря" = "12")
+#       date_out <- sprintf("%02d.%s.%s", as.integer(day), month_num, year)
+#     }
+#   }
+#   
+#   # Тип дела
+#   case_type <- case_when(
+#     str_detect(text_lower, "административн.*(?:иск|дело|производство)") ~ "Административное",
+#     str_detect(text_lower, "уголовн.*(?:дело|производство)") ~ "Уголовное",
+#     str_detect(text_lower, "гражданск.*(?:дело|производство|иск)") ~ "Гражданское",
+#     str_detect(text_lower, "коап|об административных правонарушениях") ~ "КоАП",
+#     TRUE ~ "Не определено"
+#   )
+#   
+#   # Ключевые слова
+#   kw_camera   <- str_detect(text_lower, "видеонаблюдени|камер")
+#   kw_school   <- str_detect(text_lower, "школ|образовательн")
+#   kw_children <- str_detect(text_lower, "дет|школьник|подрост|несовершеннолетн|учащ")
+#   kw_incident <- str_detect(text_lower, "инцидент|происшеств|драк|нападен|травм")
+#   kw_absence  <- str_detect(text_lower, "отсутств|не\\s+установлен|не\\s+оснащен|неисправн")
+#   kw_obligate <- str_detect(text_lower, "обязать|возложить обязанность")
+#   
+#   n_camera   <- str_count(text_lower, "видеонаблюдени")
+#   n_kamera   <- str_count(text_lower, "камер")
+#   n_school   <- str_count(text_lower, "школ")
+#   n_children <- str_count(text_lower, "несовершеннолетн|школьник|учащ")
+#   
+#   tibble(
+#     id = cid, district = district, is_valid = TRUE,
+#     court = court, case_type = case_type,
+#     date_in = date_in, date_out = date_out,
+#     text_length = text_length,
+#     kw_camera = kw_camera, kw_school = kw_school, kw_children = kw_children,
+#     kw_incident = kw_incident, kw_absence = kw_absence, kw_obligate = kw_obligate,
+#     n_camera = n_camera, n_kamera = n_kamera, n_school = n_school, n_children = n_children
+#   )
+# }
+
+extract_one <- function(path) {
+  district <- basename(dirname(path)) %>% str_remove("_Videonablyudenie_v_skole$")
+  cid <- tools::file_path_sans_ext(basename(path))
+  
+  # 1. Читаем HTML
+  html <- tryCatch(read_html(path, encoding = "UTF-8"), error = function(e) NULL)
+  if (is.null(html)) return(NULL)
+  
+  # 2. БЕЗОПАСНОЕ удаление скриптов, стилей и рекламы перед подсчетом длины текста
+  tryCatch({
+    html %>% 
+      html_elements("script, style, noscript, .ad-banner, .translate, #translator") %>% 
+      xml2::xml_remove()
+  }, error = function(e) NULL) # Игнорируем ошибку, если таких элементов нет
+  
+  # 3. Извлекаем чистый текст
+  text <- html %>% html_text2()
+  text_lower <- tolower(text)
+  text_length <- nchar(text)
+  
+  # 4. ПРОВЕРКА НА "ОБОЛОЧКУ" (если текст слишком короткий, значит это пустая страница с рекламой)
+  if (text_length < 3000) {
+    meta_desc <- html %>% html_element("meta[name='description']") %>% html_attr("content")
+    
+    return(tibble(
+      id = cid, 
+      district = district, 
+      is_valid = FALSE,
+      court = ifelse(!is.na(meta_desc), str_extract(meta_desc, "^[^,]+"), "Не найден"),
+      case_type = "Не определено (файл обрезан или пуст)",
+      date_in = NA_character_, 
+      date_out = str_extract(meta_desc, "\\d{2}\\.\\d{2}\\.\\d{4}"),
+      text_length = text_length,
+      kw_camera = FALSE, kw_school = FALSE, kw_children = FALSE,
+      kw_incident = FALSE, kw_absence = FALSE, kw_obligate = FALSE,
+      n_camera = 0, n_kamera = 0, n_school = 0, n_children = 0
+    ))
+  }
+  
+  # 5. Извлечение СУДА
+  court_match <- str_match(text, "Суд:\\s*(.+)")
+  court <- if (!is.na(court_match[1, 1])) str_trim(court_match[1, 2]) else "Не найден"
+  
+  # 6. Извлечение ДАТ
+  date_in_match <- str_match(text, "Дата начала:\\s*(\\d{2}\\.\\d{2}\\.\\d{4})")
+  date_in <- if (!is.na(date_in_match[1, 1])) date_in_match[1, 2] else NA_character_
+  
+  date_out_match <- str_match(text, "Дата рассмотрения:\\s*(\\d{2}\\.\\d{2}\\.\\d{4})")
+  date_out <- if (!is.na(date_out_match[1, 1])) date_out_match[1, 2] else NA_character_
+  
+  # Если дата рассмотрения не найдена в блоке, ищем в тексте (например, "изготовлено 25 июня 2026 года")
+  if (is.na(date_out)) {
+    m_out <- str_match(text, "(?:изготовлен|вынесен|принят|опубликован).*?(\\d{1,2})\\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\\s+(\\d{4})")
+    if (!is.na(m_out[1, 1])) {
+      day <- m_out[1, 2]
+      month_str <- m_out[1, 3]
+      year <- m_out[1, 4]
+      
+      month_num <- switch(month_str,
+                          "января" = "01", "февраля" = "02", "марта" = "03", "апреля" = "04",
+                          "мая" = "05", "июня" = "06", "июля" = "07", "августа" = "08",
+                          "сентября" = "09", "октября" = "10", "ноября" = "11", "декабря" = "12")
+      date_out <- sprintf("%02d.%s.%s", as.integer(day), month_num, year)
+    }
+  }
+  
+  # 7. Тип дела
+  case_type <- case_when(
+    str_detect(text_lower, "административн.*(?:иск|дело|производство)") ~ "Административное",
+    str_detect(text_lower, "уголовн.*(?:дело|производство)") ~ "Уголовное",
+    str_detect(text_lower, "гражданск.*(?:дело|производство|иск)") ~ "Гражданское",
+    str_detect(text_lower, "коап|об административных правонарушениях") ~ "КоАП",
+    TRUE ~ "Не определено"
+  )
+  
+  # 8. Ключевые слова
+  kw_camera   <- str_detect(text_lower, "видеонаблюдени|камер")
+  kw_school   <- str_detect(text_lower, "школ|образовательн")
+  kw_children <- str_detect(text_lower, "дет|школьник|подрост|несовершеннолетн|учащ")
+  kw_incident <- str_detect(text_lower, "инцидент|происшеств|драк|нападен|травм")
+  kw_absence  <- str_detect(text_lower, "отсутств|не\\s+установлен|не\\s+оснащен|неисправн")
+  kw_obligate <- str_detect(text_lower, "обязать|возложить обязанность")
+  pat_malfunction <- str_detect(text_lower, "неисправн|сломан|не работ|поврежден|вышел из строя|не функционирует|не подключен|отключен|не эксплуатируется")
+  pat_privacy <-     str_detect(text_lower, "раздевалк|туалет|санузл|приватн|личн(ая|ой|ую) жизн|жилое помещение|место отдыха")
+  pat_storage <- str_detect(text_lower, "утер|хранени.*запис|несанкционированн|доступ к запис|архив|срок хранения|уничтожен")
+  pat_evidence <- str_detect(text_lower, "доказательств|видеофиксаци|запис[ьи] с камер|подтвержд|видеозапис|материал.*видео")
+  pat_no_act <- str_detect(text_lower, "отсутстви(е|я|и) положени|нет локальн.*акт|не принят приказ|регламент.*видеонаблюдени")
+  pat_absence_camera <- str_detect(text_lower, "отсутств.*видеонаблюдени|не установлен.*камер|нет камер|не оснащен.*видеонаблюдени")
+  pat_improper_placement <- str_detect(text_lower, "направлен.*на (окна|жилые|раздевалк|туалет)|расположен.*неправильно|нарушени.*расположени|видеонаблюдени.*в (раздевалк|туалет)")
+  pat_no_consent <- str_detect(text_lower, "согласи.*на обработку|персональн.*данн.*дет|согласи.*родител|без согласия")
+  pat_violation_sanpin <- str_detect(text_lower, "санпин|санитарн.*норм|роспотребнадзор|нарушени.*требован.*безопасности")
+  pat_failure_to_install <- str_detect(text_lower, "не исполнен.*предписани|не выполн.*требовани.*установк|обязан.*установить.*камер")
+  pat_data_leak <- str_detect(text_lower, "утечк|распространен.*запис|публикаци.*видео|доступ.*посторонн|незаконн.*доступ.*запис")
+  pat_operational_violation <- str_detect(text_lower, "несвоевременн.*обслуживан|не проводится.*обслуживан|нарушени.*эксплуатаци|отсутствие.*техобслуживан")
+  n_violations <- sum(pat_malfunction, pat_privacy, pat_storage, pat_evidence, 
+                      pat_no_act, pat_absence_camera, pat_improper_placement, 
+                      pat_no_consent, pat_violation_sanpin, pat_failure_to_install, 
+                      pat_data_leak, pat_operational_violation, na.rm = TRUE)
+  
+  # 9. Количество упоминаний
+  n_camera   <- str_count(text_lower, "видеонаблюдени")
+  n_kamera   <- str_count(text_lower, "камер")
+  n_school   <- str_count(text_lower, "школ")
+  n_children <- str_count(text_lower, "несовершеннолетн|школьник|учащ")
+  
+  tibble(
+    id = cid, 
+    district = district, 
+    is_valid = TRUE,
+    court = court, 
+    case_type = case_type,
+    date_in = date_in, 
+    date_out = date_out,
+    text_length = text_length,
+    kw_camera = kw_camera, kw_school = kw_school, kw_children = kw_children,
+    kw_incident = kw_incident, kw_absence = kw_absence, kw_obligate = kw_obligate,
+    n_camera = n_camera, n_kamera = n_kamera, n_school = n_school, n_children = n_children,
+    pat_malfunction = pat_malfunction,
+    pat_privacy = pat_privacy,
+    pat_storage = pat_storage,
+    pat_evidence = pat_evidence,
+    pat_no_act = pat_no_act,
+    pat_absence_camera = pat_absence_camera,
+    pat_improper_placement = pat_improper_placement,
+    pat_no_consent = pat_no_consent,
+    pat_violation_sanpin = pat_violation_sanpin,
+    pat_failure_to_install = pat_failure_to_install,
+    pat_data_leak = pat_data_leak,
+    pat_operational_violation = pat_operational_violation,
+    n_violations = n_violations
+  )
+}
+
+# --- Применяем ко всем файлам ---
+cat("Извлекаю признаки...\n")
+features <- map_dfr(html_files, extract_one, .progress = TRUE)
+
+# --- Проверка результата ---
+if (is.null(features) || nrow(features) == 0) {
+  stop("Не удалось извлечь ни одного признака.")
+}
+
+# --- Постобработка ---
+features <- features %>%
+  mutate(
+    date_in  = as.Date(date_in,  format = "%d.%m.%Y"),
+    date_out = as.Date(date_out, format = "%d.%m.%Y"),
+    duration = as.numeric(date_out - date_in),
+    month_out = format(date_out, "%Y-%m")
+  )
+
+# --- Сохранение ---
+write_csv(features, file.path(BASE_DIR, "data", "cases_features.csv"))
+
+library(writexl)  # install.packages("writexl")
+write_xlsx(features, file.path(BASE_DIR, "data", "cases_features.xlsx"))
+cat("Excel-файл сохранён\n")
+
+cat(sprintf("Готово! Сохранено %d наблюдений, %d признаков\n",
+            nrow(features), ncol(features)))
+==> hypothesis_tests.R <==
+# ============================================================
+# hypothesis_tests.R
+# Проверка статистических гипотез для Главы 3.2 отчета
+# ============================================================
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+})
+
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+# Загружаем исходные данные (или можно загрузить df_clean)
+df <- read_csv(file.path(BASE_DIR, "data", "cases_features.csv"), show_col_types = FALSE)
+
+# Базовая фильтрация (как в других скриптах)
+df <- df %>%
+  filter(
+    !is.na(case_type),
+    !is.na(duration), duration > 0, duration < 365
+  )
+
+# ============================================================
+# ГИПОТЕЗА 1: Различается ли частота отсутствия камер по округам?
+# ============================================================
+cat("\n======================================================\n")
+cat("ГИПОТЕЗА 1: Зависит ли отсутствие камер (pat_absence_camera) от региона?\n")
+cat("H0: Признак pat_absence_camera не зависит от федерального округа (распределения одинаковы).\n")
+cat("H1: Признак pat_absence_camera зависит от федерального округа (распределения различаются).\n")
+cat("Метод: Критерий хи-квадрат Пирсона (Chi-squared test)\n")
+cat("======================================================\n")
+
+# Создаем таблицу сопряженности (Contingency table)
+table_h1 <- table(df$district, df$pat_absence_camera)
+print(table_h1)
+
+# Запускаем тест
+test_h1 <- chisq.test(table_h1)
+print(test_h1)
+
+# Вывод для отчета
+p_val_h1 <- test_h1$p.value
+if(p_val_h1 < 0.05) {
+  cat(sprintf("\nВЫВОД: p-value = %.4f < 0.05. Отвергаем H0. \nЧастота отсутствия камер статистически значимо различается по округам.\n", p_val_h1))
+} else {
+  cat(sprintf("\nВЫВОД: p-value = %.4f >= 0.05. Нет оснований отвергнуть H0. \nРазличия по округам статистически не значимы.\n", p_val_h1))
+}
+
+
+# ============================================================
+# ГИПОТЕЗА 2: Влияет ли использование камер как доказательства на срок дела?
+# ============================================================
+cat("\n======================================================\n")
+cat("ГИПОТЕЗА 2: Различается ли длительность суда при использовании видео как доказательства?\n")
+cat("H0: Медиана длительности дел с pat_evidence равна медиане длительности дел без него.\n")
+cat("H1: Медиана длительности дел с pat_evidence отличается.\n")
+cat("Метод: U-критерий Манна-Уитни (Wilcoxon rank sum test)\n")
+cat("======================================================\n")
+
+# Смотрим медианы для контекста
+medians <- df %>%
+  group_by(pat_evidence) %>%
+  summarise(
+    n_cases = n(),
+    median_duration = median(duration, na.rm = TRUE),
+    mean_duration = mean(duration, na.rm = TRUE)
+  )
+print(medians)
+
+# Запускаем тест Манна-Уитни (так как данные о длительности скошены и не нормальны)
+test_h2 <- wilcox.test(duration ~ pat_evidence, data = df)
+print(test_h2)
+
+# Вывод для отчета
+p_val_h2 <- test_h2$p.value
+if(p_val_h2 < 0.05) {
+  cat(sprintf("\nВЫВОД: p-value = %.4f < 0.05. Отвергаем H0. \nДлительность рассмотрения дел статистически значимо различается в зависимости от использования видеозаписей как доказательств.\n", p_val_h2))
+} else {
+  cat(sprintf("\nВЫВОД: p-value = %.4f >= 0.05. Нет оснований отвергнуть H0. \nСтатистически значимых различий в длительности не обнаружено.\n", p_val_h2))
+}
+==> parser.R <==
+# ============================================================
+# universal_parser.R
+# Аналог universal_parser.py на языке R
+# Требуется: chromote, rvest, stringr, jsonlite, xml2, base64enc
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(chromote)
+  library(rvest)
+  library(stringr)
+  library(jsonlite)
+  library(xml2)
+  library(base64enc)
+})
+
+# --------------------- НАСТРОЙКИ ---------------------
+BASE_URL      <- "https://xn--90afdbaav0bd1afy6eub5d.xn--p1ai"
+DEFAULT_QUERY <- "видеонаблюдение в школе"
+
+# Автоматическая проверка пути к Edge (64-bit предпочтительнее)
+edge_path <- "C:/Program Files/Microsoft/Edge/Application/msedge.exe"
+if (!file.exists(edge_path)) {
+  edge_path <- "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+}
+Sys.setenv(CHROMOTE_CHROME = edge_path)
+cat(sprintf("Используется браузер: %s\n", Sys.getenv("CHROMOTE_CHROME")))
+
+DISTRICTS <- list(
+  "Tsentralny_FO"       = "Центральный ФО",
+  "Severo_Zapadny_FO"   = "Северо-Западный ФО",
+  "Yuzhny_FO"           = "Южный ФО",
+  "Privolzhsky_FO"      = "Приволжский ФО",
+  "Uralsky_FO"          = "Уральский ФО",
+  "Sibirsky_FO"         = "Сибирский ФО",
+  "Dalnevostochny_FO"   = "Дальневосточный ФО",
+  "Severo_Kavkazsky_FO" = "Северо-Кавказский ФО",
+  "Krymsky_FO"          = "Крымский ФО"
+)
+
+DELAY_BETWEEN_PAGES        <- 10.0
+DELAY_BETWEEN_DOWNLOADS    <- 10.0
+MAX_RETRIES                <- 3
+RETRY_DELAY                <- 10
+PAUSE_AFTER_CONSECUTIVE_FAILS <- 15
+
+# --- Папка для сохранения результатов ---
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+dir.create(BASE_DIR, showWarnings = FALSE, recursive = TRUE)
+cat(sprintf("DEBUG: BASE_DIR = %s\n", BASE_DIR))
+
+# --------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------
+
+# Безопасное выполнение JS в браузере (с защитой от ошибок)
+eval_js <- function(session, js) {
+  res <- tryCatch(
+    session$Runtime$evaluate(js, returnByValue = TRUE),
+    error = function(e) list(result = NULL)
+  )
+  if (!is.null(res$result) && !is.null(res$result$value)) {
+    return(res$result$value)
+  }
+  return(NULL)
+}
+
+# Навигация с повторами и увеличенным таймаутом
+safe_get <- function(session, url, retries = MAX_RETRIES) {
+  for (attempt in seq_len(retries)) {
+    ok <- tryCatch({
+      # Увеличиваем таймаут до 60 секунд (60000 мс)
+      session$Page$navigate(url, timeout = 60000)
+      Sys.sleep(4) # Даем больше времени на первоначальную отрисовку DOM
+      TRUE
+    }, error = function(e) {
+      cat(sprintf("    Попытка %d не удалась: %s\n", attempt, conditionMessage(e)))
+      FALSE
+    })
+    if (ok) return(TRUE)
+    if (attempt < retries) Sys.sleep(RETRY_DELAY)
+  }
+  FALSE
+}
+
+# 
+# # Получить HTML текущей страницы
+# get_html <- function(session) {
+#   res <- session$Runtime$evaluate(
+#     "document.documentElement.outerHTML",
+#     returnByValue = TRUE
+#   )
+#   res$result$value
+# }
+# Ошибка при обработке округа Центральный ФО:
+#   no applicable method for 'read_xml'
+# applied to an object of class "NULL"
+
+get_html <- function(session, retries = 5) {
+  for (i in seq_len(retries)) {
+    res <- tryCatch(
+      session$Runtime$evaluate(
+        "document.documentElement.outerHTML",
+        returnByValue = TRUE
+      ),
+      error = function(e) NULL
+    )
+    
+    # ЖЕСТКАЯ ПРОВЕРКА: гарантируем, что вернется строка, а не NULL
+    if (!is.null(res) && 
+        !is.null(res$result) && 
+        !is.null(res$result$value) && 
+        is.character(res$result$value) && 
+        nzchar(res$result$value)) {
+      return(res$result$value)
+    }
+    Sys.sleep(1)
+  }
+  stop("Не удалось получить HTML страницы после нескольких попыток (вернулся NULL или пустая строка)")
+}
+
+select_district <- function(session, label_text) {
+  # Ждем полной загрузки главной страницы и прохождения антибот-проверки
+  cat("Ожидание загрузки главной страницы и прохождения проверок...\n")
+  Sys.sleep(5) # Даем 5 секунд на выполнение скрытых JS-скритов сайта
+  
+  # УВЕЛИЧЕННЫЙ ТАЙМАУТ: ждем до 60 секунд появления дерева судов
+  cat("Ожидание загрузки дерева судов (до 60 секунд)...\n")
+  tree_loaded <- FALSE
+  for (i in 1:60) {
+    # Проверяем наличие элементов дерева
+    n_lines <- eval_js(session, "document.querySelectorAll('div.aciTreeLine').length")
+    
+    # Дополнительная проверка: ищем конкретный текст округа в дереве
+    label_json <- jsonlite::toJSON(label_text, auto_unbox = TRUE)
+    tree_has_label <- eval_js(session, sprintf("
+      (function() {
+        let lines = document.querySelectorAll('div.aciTreeLine');
+        for (let line of lines) {
+          let txt = line.querySelector('.aciTreeText');
+          if (txt && txt.textContent.trim() === %s) {
+            return true;
+          }
+        }
+        return false;
+      })()
+    ", label_json))
+    
+    if (!is.null(n_lines) && n_lines > 0 && !is.null(tree_has_label) && tree_has_label == TRUE) {
+      cat(sprintf("Дерево загружено (найдено %d элементов, округ найден). Попытка %d.\n", n_lines, i))
+      tree_loaded <- TRUE
+      break
+    }
+    
+    if (i %% 10 == 0) {
+      cat(sprintf("  ... ожидание %d секунд (найдено %d элементов дерева)\n", i, ifelse(is.null(n_lines), 0, n_lines)))
+    }
+    Sys.sleep(1)
+  }
+  
+  if (!tree_loaded) {
+    # Сохраняем HTML для диагностики
+    debug_html <- get_html(session)
+    writeLines(debug_html, file.path(BASE_DIR, "debug_tree_not_loaded.html"))
+    stop(sprintf("Дерево судов не загрузилось за 60 секунд. Сохранен debug_tree_not_loaded.html для диагностики.\n",
+                 "Возможные причины:\n",
+                 "1. Сайт заблокировал автоматический доступ\n",
+                 "2. Рекламные скрипты блокируют загрузку дерева\n",
+                 "3. Структура дерева изменилась"))
+  }
+  
+  # БЕЗОПАСНАЯ передача строки в JS через jsonlite
+  label_json <- jsonlite::toJSON(label_text, auto_unbox = TRUE)
+  
+  js <- sprintf("
+    (function() {
+      let lines = document.querySelectorAll('div.aciTreeLine');
+      for (let line of lines) {
+        let txt = line.querySelector('.aciTreeText');
+        if (txt && txt.textContent.trim() === %s) {
+          let push = line.querySelector('.aciTreePush');
+          if (push) { push.click(); }
+          let check = line.querySelector('.aciTreeCheck');
+          if (check && !check.classList.contains('aciTreeChecked')) {
+            check.click();
+          }
+          return 'ok';
+        }
+      }
+      return 'not_found';
+    })()
+  ", label_json)
+  
+  res <- eval_js(session, js)
+  if (is.null(res) || res != "ok") {
+    stop(sprintf("Не найден узел дерева с текстом '%s'.", label_text))
+  }
+  Sys.sleep(2)
+  
+  # Дополнительно кликаем все дочерние чекбоксы, которые могли появиться
+  js2 <- "
+    (function() {
+      let checks = document.querySelectorAll('.aciTreeCheck');
+      let n = 0;
+      for (let c of checks) {
+        if (!c.classList.contains('aciTreeChecked')) {
+          c.click();
+          n++;
+        }
+      }
+      return n;
+    })()
+  "
+  eval_js(session, js2)
+  Sys.sleep(1)
+  cat(sprintf("Выбраны все суды/регионы для: %s\n", label_text))
+}
+
+# 12/10/26 Обновили сайт! Больше нельзя просто нажать на нужную кнопку!
+# select_district <- function(session, label_text) {
+#   # Ждем полной загрузки главной страницы и прохождения антибот-проверки
+#   cat("Ожидание загрузки главной страницы и прохождения проверок...\n")
+#   Sys.sleep(5) # Даем 5 секунд на выполнение скрытых JS-скриптов сайта
+#   
+#   for (i in 1:30) {
+#     # Проверяем наличие именно дерева судов, а не просто длины страницы
+#     tree_ready <- eval_js(session, "document.querySelectorAll('div.aciTreeLine').length > 0")
+#     if (!is.null(tree_ready) && tree_ready == TRUE) {
+#       cat(sprintf("Дерево судов загружено (попытка %d).\n", i))
+#       break
+#     }
+#     Sys.sleep(1)
+#   }
+#   
+#   # Дополнительная диагностика: выводим заголовок страницы
+#   page_title <- eval_js(session, "document.title")
+#   cat(sprintf("Заголовок страницы: %s\n", ifelse(is.null(page_title), "NULL", page_title)))
+#   
+#   # Ждем появления элементов дерева в DOM (до 20 секунд)
+#   cat("Ожидание загрузки дерева судов...\n")
+#   for (i in 1:20) {
+#     n_lines <- eval_js(session, "document.querySelectorAll('div.aciTreeLine').length")
+#     if (!is.null(n_lines) && n_lines > 0) {
+#       cat(sprintf("Дерево загружено (найдено %d элементов).\n", n_lines))
+#       break
+#     }
+#     Sys.sleep(1)
+#   }
+#   
+#   # Если дерево так и не появилось, выводим диагностику
+#   if (is.null(n_lines) || n_lines == 0) {
+#     # Сохраняем HTML для анализа
+#     debug_html <- get_html(session)
+#     writeLines(debug_html, file.path(BASE_DIR, "debug_page.html"))
+#     cat("ДИАГНОСТИКА: Дерево судов не появилось. Сохранен debug_page.html\n")
+#     cat("Проверьте файл debug_page.html в браузере.\n")
+#     stop(sprintf("Не найден узел дерева с текстом '%s'. Дерево судов не загрузилось.", label_text))
+#   }
+#   
+#   # БЕЗОПАСНАЯ передача строки в JS через jsonlite
+#   label_json <- jsonlite::toJSON(label_text, auto_unbox = TRUE)
+#   
+#   js <- sprintf("
+#     (function() {
+#       let lines = document.querySelectorAll('div.aciTreeLine');
+#       for (let line of lines) {
+#         let txt = line.querySelector('.aciTreeText');
+#         if (txt && txt.textContent.trim() === %s) {
+#           let push = line.querySelector('.aciTreePush');
+#           if (push) { push.click(); }
+#           let check = line.querySelector('.aciTreeCheck');
+#           if (check && !check.classList.contains('aciTreeChecked')) {
+#             check.click();
+#           }
+#           return 'ok';
+#         }
+#       }
+#       return 'not_found';
+#     })()
+#   ", label_json)
+#   
+#   res <- eval_js(session, js)
+#   if (is.null(res) || res != "ok") {
+#     stop(sprintf("Не найден узел дерева с текстом '%s'. Возможно, дерево еще не загрузилось.", label_text))
+#   }
+#   Sys.sleep(2)
+#   
+#   # Дополнительно кликаем все дочерние чекбоксы, которые могли появиться
+#   js2 <- "
+#     (function() {
+#       let checks = document.querySelectorAll('.aciTreeCheck');
+#       let n = 0;
+#       for (let c of checks) {
+#         if (!c.classList.contains('aciTreeChecked')) {
+#           c.click();
+#           n++;
+#         }
+#       }
+#       return n;
+#     })()
+#   "
+#   eval_js(session, js2)
+#   Sys.sleep(1)
+#   cat(sprintf("Выбраны все суды/регионы для: %s\n", label_text))
+# }
+
+# Конвертация одного HTML в PDF
+convert_single_case <- function(session, html_path, delete_html = FALSE) {
+  pdf_path <- sub("\\.html$", ".pdf", html_path)
+  abs_path <- normalizePath(html_path, mustWork = FALSE)
+  file_url <- paste0("file:///", gsub("\\\\", "/", abs_path))
+  tryCatch({
+    session$Page$navigate(file_url)
+    Sys.sleep(1)
+    res <- session$Page$printToPDF(
+      printBackground = TRUE,
+      paperWidth      = 8.27,
+      paperHeight     = 11.69,
+      marginTop       = 0.4,
+      marginBottom    = 0.4,
+      marginLeft      = 0.4,
+      marginRight     = 0.4
+    )
+    writeBin(base64decode(res$data), pdf_path)
+    if (delete_html) file.remove(html_path)
+    TRUE
+  }, error = function(e) {
+    cat(sprintf("    Ошибка конвертации %s: %s\n", html_path, conditionMessage(e)))
+    FALSE
+  })
+}
+
+# Скачивание дел одного округа
+download_district <- function(session, selected_key, selected_label, query,
+                              max_pages = NULL,
+                              convert_to_pdf = FALSE,
+                              delete_html_after_pdf = FALSE) {
+  output_dir     <- file.path(BASE_DIR, paste0(selected_key, "_Videonablyudenie_v_skole"))
+  case_ids_file  <- file.path(BASE_DIR, paste0("case_ids_", selected_key, ".json"))
+  failed_file    <- file.path(BASE_DIR, paste0("failed_ids_", selected_key, ".txt"))
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  if (file.exists(case_ids_file)) {
+    all_ids <- fromJSON(case_ids_file)
+    if (is.list(all_ids)) all_ids <- unlist(all_ids, use.names = FALSE)
+    if (is.null(all_ids))  all_ids <- character(0)
+    cat(sprintf("Загружено %d ID из %s\n", length(all_ids), case_ids_file))
+  } else {
+    # cat("Файл с ID не найден, начинаю поиск с выбором округа...\n")
+    # safe_get(session, BASE_URL)
+    # Sys.sleep(2)
+    # 
+    # select_district(session, selected_label)
+    
+    cat("Файл с ID не найден, начинаю поиск с выбором округа...\n")
+    
+    # Открываем главную страницу с проверкой успеха
+    nav_ok <- safe_get(session, BASE_URL)
+    if (!nav_ok) {
+      stop("Не удалось открыть главную страницу после нескольких попыток. Пропускаю округ.")
+    }
+    Sys.sleep(2)
+    
+    select_district(session, selected_label)
+    
+    # --- 1. Заполняем поле поиска и отправляем форму ---
+    query_json <- jsonlite::toJSON(query, auto_unbox = TRUE)
+    js_search <- sprintf("
+      (function() {
+        let input = document.querySelector('input[name=\"simpleSearch[content]\"]');
+        if (!input) return 'no_input';
+        input.value = %s;
+        let btn = document.querySelector('#simpleSearch_search');
+        if (btn) { btn.click(); return 'clicked'; }
+        let form = input.closest('form');
+        if (form) { form.submit(); return 'submitted'; }
+        return 'no_form';
+      })()
+    ", query_json)
+    
+    res <- eval_js(session, js_search)
+    cat(sprintf("Отправка формы: %s\n", res))
+    
+    # --- 2. Ждём появления таблицы с результатами поиска (до 30 сек) ---
+    cat("Ожидание загрузки результатов поиска...\n")
+    table_found <- FALSE
+    for (i in 1:30) {
+      n_tables <- eval_js(session, "document.querySelectorAll('table.table-bordered').length")
+      if (!is.null(n_tables) && n_tables > 0) {
+        cat(sprintf("Результаты появились (таблиц: %d, попытка %d)\n", n_tables, i))
+        table_found <- TRUE
+        break
+      }
+      Sys.sleep(1)
+    }
+    
+    # --- 3. Если таблица не появилась — переходим на /search напрямую ---
+    if (!table_found) {
+      cat("Таблица результатов не появилась. Перехожу на /search напрямую...\n")
+      safe_get(session, paste0(BASE_URL, "/search"))
+      Sys.sleep(3)
+      
+      # Повторная проверка
+      for (i in 1:15) {
+        n_tables <- eval_js(session, "document.querySelectorAll('table.table-bordered').length")
+        if (!is.null(n_tables) && n_tables > 0) {
+          cat(sprintf("Результаты появились после перехода на /search (таблиц: %d)\n", n_tables))
+          table_found <- TRUE
+          break
+        }
+        Sys.sleep(1)
+      }
+    }
+    
+    # --- 4. Диагностика: если таблиц всё равно нет, сохраняем HTML ---
+    if (!table_found) {
+      debug_html <- get_html(session)
+      writeLines(debug_html, file.path(BASE_DIR, "debug_search_empty.html"))
+      cat("ДИАГНОСТИКА: Таблица результатов так и не появилась.\n")
+      cat("Сохранён debug_search_empty.html для анализа.\n")
+      stop("Не удалось получить результаты поиска. Проверьте debug_search_empty.html")
+    }
+    
+    all_ids  <- character(0)
+    page_num <- 1
+    
+    repeat {
+      if (!is.null(max_pages) && page_num > max_pages) {
+        cat(sprintf("Достигнуто ограничение в %d стр., останавливаю сбор.\n", max_pages))
+        break
+      }
+      cat(sprintf("\nОбработка страницы %d\n", page_num))
+      Sys.sleep(1)
+      
+      html <- get_html(session)
+      
+      # ЖЕСТКАЯ ЗАЩИТА ПЕРЕД read_html: предотвращает ошибку read_xml(NULL)
+      if (is.null(html) || !is.character(html) || !nzchar(html)) {
+        stop("Получен пустой или NULL HTML. Невозможно распарсить страницу.")
+      }
+      
+      soup <- read_html(html, encoding = "UTF-8")
+      links <- soup %>% html_nodes("table.table-bordered a") %>% html_attr("href")
+      links <- links[!is.na(links)]
+      
+      new_ids <- character(0)
+      for (href in links) {
+        if (str_detect(href, "^/\\d+$")) {
+          cid <- str_remove(href, "^/")
+          if (!(cid %in% all_ids)) {
+            all_ids  <- c(all_ids, cid)
+            new_ids  <- c(new_ids, cid)
+          }
+        }
+      }
+      cat(sprintf("  Найдено новых ID: %d (всего: %d)\n", length(new_ids), length(all_ids)))
+      
+      # # Клик по кнопке "Следующая страница"
+      # js_next <- "
+      #   (function() {
+      #     let links = document.querySelectorAll('ul.pagination a');
+      #     for (let l of links) {
+      #       let t = l.textContent.trim();
+      #       if (t === '»' || t === '›' || t === '>') {
+      #         l.click();
+      #         return 'next';
+      #       }
+      #     }
+      #     return 'end';
+      #   })()
+      # "
+      # chromote не всегда дожидается load
+      
+      # --- Находим URL следующей страницы ---
+      js_next_href <- "
+        (function() {
+          let links = document.querySelectorAll('ul.pagination a');
+          for (let l of links) {
+            let t = l.textContent.trim();
+            if (t === '»' || t === '›' || t === '>') {
+              return l.href;
+            }
+          }
+          return null;
+        })()
+      "
+      next_url <- eval_js(session, js_next_href)
+      
+      if (is.null(next_url) || !nzchar(next_url) || next_url == "null") {
+        cat("  Пагинация завершена.\n")
+        break
+      }
+      
+      cat(sprintf("  Переход на %s\n", next_url))
+      
+      # Используем safe_get вместо прямого navigate, чтобы были повторные попытки при таймауте
+      nav_success <- safe_get(session, next_url)
+      
+      if (!nav_success) {
+        cat("  Не удалось загрузить страницу после нескольких попыток (таймаут сервера). Останавливаю сбор.\n")
+        break
+      }
+      
+      # Ждём, пока на новой странице появятся таблицы результатов
+      for (i in 1:20) {
+        n_tables <- eval_js(session, "document.querySelectorAll('table.table-bordered').length")
+        if (!is.null(n_tables) && n_tables > 0) break
+        Sys.sleep(1)
+      }
+      Sys.sleep(DELAY_BETWEEN_PAGES)
+      
+      page_num <- page_num + 1
+      
+      #   res <- eval_js(session, js_next)
+      #   if (is.null(res) || res == "end") {
+      #     cat("  Пагинация завершена.\n")
+      #     break
+      #   }
+      #   page_num <- page_num + 1
+      #   Sys.sleep(DELAY_BETWEEN_PAGES)
+    }
+    # не актуален 
+    
+    write_json(all_ids, case_ids_file, auto_unbox = TRUE, pretty = TRUE)
+    cat(sprintf("Собрано %d ID, сохранено в %s\n", length(all_ids), case_ids_file))
+  }
+  
+  if (length(all_ids) == 0) {
+    cat("Нет ID для обработки.\n")
+    return(invisible())
+  }
+  
+  existing  <- list.files(output_dir)
+  remaining <- all_ids[!(paste0(all_ids, ".html") %in% existing)]
+  cat(sprintf("Уже скачано: %d; осталось: %d\n",
+              length(all_ids) - length(remaining), length(remaining)))
+  if (length(remaining) == 0) {
+    cat("Всё уже загружено!\n")
+    return(invisible())
+  }
+  # Минимальная длина для валидного решения (без учета огромных страниц ошибок браузера)
+  MIN_VALID_LENGTH <- 25000 
+  
+  cat("Начинаю загрузку решений...\n")
+  downloaded_count <- 0
+  fails_in_row <- 0
+  failed_ids <- character(0)
+  
+  for (i in seq_along(remaining)) {
+    cid <- remaining[i]
+    url <- paste0(BASE_URL, "/", cid)
+    cat(sprintf("[%d/%d] %s\n", i, length(remaining), url))
+    
+    success <- FALSE
+    
+    # Цикл повторных попыток для одного ID
+    for (attempt in 1:MAX_RETRIES) {
+      if (attempt > 1) {
+        cat(sprintf("    Попытка %d: ждем и пробуем снова...\n", attempt))
+        Sys.sleep(5)
+      }
+      
+      if (safe_get(session, url)) {
+        html_content <- get_html(session)
+        html_lower <- tolower(html_content)
+        
+        # 1. ПРОВЕРКА НА СТРАНИЦУ ОШИБКИ БРАУЗЕРА (Chromium/Chrome)
+        # Эти страницы могут быть огромными, но они не являются решением суда
+        is_browser_error <- str_detect(html_lower, "err_") ||
+          str_detect(html_lower, "chromium") ||
+          str_detect(html_lower, "no internet") ||
+          str_detect(html_lower, "name not resolved") ||
+          str_detect(html_lower, "connection refused")
+        
+        # 2. ПРОВЕРКА НА КАПЧУ / БЛОКИРОВКУ
+        is_blocked <- str_detect(html_lower, "cloudflare|captcha|проверка браузера|доступ ограничен")
+        
+        # 3. ПРОВЕРКА НА ДЛИНУ (только если это не ошибка браузера и не капча)
+        is_too_short <- !is_browser_error && !is_blocked && (nchar(html_content) < MIN_VALID_LENGTH)
+        
+        if (is_browser_error || is_blocked) {
+          cat("    Обнаружена ошибка браузера или блокировка. Пропускаю этот ID.\n")
+          break # Выходим из цикла попыток, этот ID точно не загрузится
+          
+        } else if (is_too_short) {
+          cat(sprintf("    Страница слишком короткая (%d симв.). Повторная попытка...\n", nchar(html_content)))
+          # Цикл for продолжится, увеличив attempt
+          
+        } else {
+          # ВСЁ ОТЛИЧНО! Сохраняем файл
+          html_path <- file.path(output_dir, paste0(cid, ".html"))
+          writeLines(html_content, html_path, useBytes = TRUE)
+          cat(sprintf("    Сохранён (%d симв.)\n", nchar(html_content)))
+          success <- TRUE
+          break # Успех, выходим из цикла попыток
+        }
+      } else {
+        cat("    Ошибка навигации. Повторная попытка...\n")
+      }
+    } # Конец цикла попыток для одного ID
+    
+    # Обновляем счетчики ПОСЛЕ завершения попыток для текущего ID
+    if (success) {
+      downloaded_count <- downloaded_count + 1
+      fails_in_row <- 0
+    } else {
+      failed_ids <- c(failed_ids, cid)
+      fails_in_row <- fails_in_row + 1
+      cat("    Не удалось скачать после всех попыток.\n")
+      
+      if (fails_in_row >= 3) {
+        cat(sprintf("    Слишком много ошибок подряд, пауза %d сек...\n", PAUSE_AFTER_CONSECUTIVE_FAILS))
+        Sys.sleep(PAUSE_AFTER_CONSECUTIVE_FAILS)
+        fails_in_row <- 0
+      }
+    }
+    
+    Sys.sleep(DELAY_BETWEEN_DOWNLOADS)
+  }
+  
+  # Финальный отчет
+  if (length(failed_ids) > 0) {
+    failed_file <- file.path(BASE_DIR, paste0("failed_ids_", selected_key, ".txt"))
+    writeLines(failed_ids, failed_file)
+    cat(sprintf("Неудачные ID сохранены в %s (%d шт.)\n", failed_file, length(failed_ids)))
+  }
+  
+  cat(sprintf("Готово. За сессию успешно скачано: %d файлов.\n", downloaded_count))
+
+  }
+
+# =============== ГЛАВНОЕ МЕНЮ ===============
+main <- function() {
+  cat("=== Универсальный парсер судебных решений (R) ===\n")
+  
+  query <- readline(sprintf("Введите поисковый запрос (Enter для '%s'): ", DEFAULT_QUERY))
+  if (query == "") query <- DEFAULT_QUERY
+  cat(sprintf("Будет использован запрос: '%s'\n", query))
+  
+  cat("\nВыберите режим федерального округа:\n")
+  cat("1. Один округ\n")
+  cat("2. Все округа (9 штук)\n")
+  mode_choice <- readline("Ваш выбор (1/2): ")
+  
+  if (mode_choice == "1") {
+    cat("\nДоступные округа:\n")
+    keys   <- names(DISTRICTS)
+    labels <- unlist(DISTRICTS, use.names = FALSE)
+    for (i in seq_along(keys)) cat(sprintf("  %d. %s\n", i, labels[i]))
+    idx <- suppressWarnings(as.integer(readline("Введите номер округа: ")))
+    if (is.na(idx) || idx < 1 || idx > length(keys)) {
+      cat("Некорректный номер. Выход.\n"); return(invisible())
+    }
+    selected_keys   <- keys[idx]
+    selected_labels <- labels[idx]
+  } else if (mode_choice == "2") {
+    selected_keys   <- names(DISTRICTS)
+    selected_labels <- unlist(DISTRICTS, use.names = FALSE)
+  } else {
+    cat("Неверный выбор. Выход.\n"); return(invisible())
+  }
+  
+  pages_input <- readline("\nСколько страниц результатов обработать? (Enter - все страницы): ")
+  if (pages_input == "") {
+    max_pages <- NULL
+  } else {
+    mp <- suppressWarnings(as.integer(pages_input))
+    if (is.na(mp) || mp <= 0) {
+      cat("Некорректное число, будет использовано значение по умолчанию (все страницы).\n")
+      max_pages <- NULL
+    } else max_pages <- mp
+  }
+  
+  cat("\nВыберите режим обработки HTML-файлов:\n")
+  cat("1. Оставить только HTML (без конвертации в PDF)\n")
+  cat("2. Сразу конвертировать в PDF и УДАЛИТЬ исходный HTML\n")
+  cat("3. Сразу конвертировать в PDF, но СОХРАНИТЬ HTML\n")
+  convert_choice <- readline("Ваш выбор (1/2/3): ")
+  
+  if (convert_choice == "2") {
+    convert_to_pdf        <- TRUE
+    delete_html_after_pdf <- TRUE
+  } else if (convert_choice == "3") {
+    convert_to_pdf        <- TRUE
+    delete_html_after_pdf <- FALSE
+  } else {
+    convert_to_pdf        <- FALSE
+    delete_html_after_pdf <- FALSE
+  }
+  
+  cat("\nЗапуск браузера...\n")
+  # session <- ChromoteSession$new()
+  # Создаем сессию с размером окна обычного пользователя
+  session <- ChromoteSession$new(width = 1920, height = 1080)
+  
+  # 1. Устанавливаем User-Agent обычного Chrome
+  session$Network$setUserAgentOverride(
+    userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  )
+  
+  # 2. Маскируем признак автоматизации (headless)
+  session$Runtime$evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => false});")
+  
+  on.exit(session$close(), add = TRUE)
+  
+  for (i in seq_along(selected_keys)) {
+    key   <- selected_keys[i]
+    label <- selected_labels[i]
+    cat(sprintf("\n=== Обработка округа: %s ===\n", label))
+    tryCatch({
+      download_district(session, key, label, query, max_pages,
+                        convert_to_pdf, delete_html_after_pdf)
+    }, error = function(e) {
+      cat(sprintf("ОШИБКА при обработке округа %s: %s\n",
+                  label, conditionMessage(e)))
+    })
+  }
+  
+  cat("\nВсе операции завершены.\n")
+}
+
+# Точка входа
+main()
+==> predictive_model_duration.R <==
+# ============================================================
+# predictive_model_duration.R
+# ============================================================
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr)
+  library(ggplot2); library(randomForest)
+})
+
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+
+# --- 1. Загрузка ---
+df <- read_csv(file.path(BASE_DIR, "data", "cases_features.csv"),
+               show_col_types = FALSE)
+cat(sprintf("Загружено %d наблюдений\n", nrow(df)))
+
+# --- 2. Паттерны ---
+pattern_features <- c(
+  "pat_evidence", "pat_storage", "pat_absence_camera",
+  "pat_violation_sanpin", "pat_data_leak", "pat_malfunction"
+)
+
+# --- 3. Фильтрация + признаки ---
+df_model <- df %>%
+  filter(
+    text_length > 5000,
+    !is.na(case_type),
+    !str_detect(case_type, "Не определено"),
+    !is.na(duration), duration > 0, duration < 365,
+    !is.na(district)
+  ) %>%
+  mutate(
+    n_violations = rowSums(across(all_of(pattern_features)), na.rm = TRUE)
+  ) %>%
+  mutate(
+    district    = factor(district),
+    case_type   = factor(case_type),
+    kw_children = factor(kw_children),
+    kw_incident = factor(kw_incident),
+    kw_absence  = factor(kw_absence),
+    across(all_of(pattern_features), ~ factor(.x))
+  )
+
+cat(sprintf("Для моделирования отобрано %d наблюдений\n", nrow(df_model)))
+
+# --- 4. Сводка отбракованных строк  ← ЭТО БЫЛО ПРОПУЩЕНО ---
+n_removed <- nrow(df) - nrow(df_model)
+cat(sprintf("Отброшено строк: %d (%.1f%% от исходных %d)\n",
+            n_removed, 100 * n_removed / nrow(df), nrow(df)))
+
+# --- 5. Очищенный датасет для Power BI  ← ЭТО ТОЖЕ БЫЛО ПРОПУЩЕНО ---
+df_clean <- df_model %>%
+  mutate(across(where(is.factor), as.character))
+write_csv(df_clean, file.path(BASE_DIR, "data", "cases_features_clean.csv"))
+cat(sprintf("Очищенный датасет сохранён (%d строк, %d колонок)\n",
+            nrow(df_clean), ncol(df_clean)))
+
+# --- 6. Сравнение трёх моделей ---
+fml1 <- duration ~ district + case_type + text_length +
+  kw_children + kw_incident + kw_absence
+
+fml2 <- duration ~ district + case_type + text_length +
+  kw_children + kw_incident + kw_absence + n_violations
+
+fml3 <- as.formula(paste(
+  "duration ~ district + case_type + text_length +",
+  "kw_children + kw_incident + kw_absence +",
+  paste(pattern_features, collapse = " + ")
+))
+
+set.seed(42); m1 <- randomForest(fml1, df_model, ntree = 500, importance = TRUE)
+set.seed(42); m2 <- randomForest(fml2, df_model, ntree = 500, importance = TRUE)
+set.seed(42); m3 <- randomForest(fml3, df_model, ntree = 500, importance = TRUE)
+
+compare <- tibble(
+  Модель = c("Базовая", "+ n_violations", "+ отдельные паттерны"),
+  R2     = c(m1$rsq[500], m2$rsq[500], m3$rsq[500]) * 100,
+  MAE    = c(
+    mean(abs(predict(m1) - df_model$duration)),
+    mean(abs(predict(m2) - df_model$duration)),
+    mean(abs(predict(m3) - df_model$duration))
+  )
+)
+print(compare)
+write_csv(compare, file.path(BASE_DIR, "data", "model_comparison.csv"))
+
+# --- 7. Финальная модель (выберите лучшую по R²/MAE) ---
+model_rf <- m3   # например, с отдельными паттернами
+
+cat("\n--- Резюме финальной модели ---\n")
+print(model_rf)
+n_removed <- nrow(df) - nrow(df_model)
+df_clean  <- df_model %>% mutate(across(where(is.factor), as.character))
+write_csv(df_clean, file.path(BASE_DIR, "data", "cases_features_clean.csv"))
+
+# --- 8. Важность признаков ---
+imp_data <- as.data.frame(importance(model_rf))
+imp_data$Признак <- rownames(imp_data)
+imp_data <- imp_data %>% arrange(desc(IncNodePurity))
+print(imp_data)
+
+p_imp <- ggplot(imp_data, aes(reorder(Признак, IncNodePurity), IncNodePurity)) +
+  geom_col(fill = "steelblue", alpha = 0.85) + coord_flip() +
+  labs(title = "Важность признаков для предсказания длительности",
+       subtitle = "IncNodePurity (чем выше — тем сильнее признак влияет на срок)",
+       x = NULL, y = "Важность") +
+  theme_minimal(base_size = 14)
+
+ggsave(file.path(BASE_DIR, "eda_plots", "ALL", "model_importance_duration.png"),
+       p_imp, width = 9, height = 5, dpi = 150)
+
+# --- 9. Качество финальной модели ---
+predictions <- predict(model_rf)
+mae  <- mean(abs(predictions - df_model$duration))
+rmse <- sqrt(mean((predictions - df_model$duration)^2))
+
+cat(sprintf("MAE: %.1f дней\n", mae))
+cat(sprintf("RMSE: %.1f дней\n", rmse))
+cat(sprintf("OOB R²: %.1f%%\n", model_rf$rsq[500] * 100))
+
+# --- 10. Распределение n_violations ---
+cat("\nРаспределение n_violations:\n")
+print(table(df_model$n_violations))
+
+# --- 11. Сохранение важности ---
+write_csv(imp_data, file.path(BASE_DIR, "data", "model_duration_importance.csv"))
+
+# --- 12. Markdown-отчёт ---
+top3 <- head(imp_data, 3)
+
+md_lines <- c(
+  "# Результаты моделирования: Предсказание длительности дела",
+  "",
+  sprintf("**Дата:** %s", Sys.time()),
+  sprintf("**Исходная выборка:** %d наблюдений", nrow(df)),
+  sprintf("**После фильтрации:** %d наблюдений (отброшено %d)", nrow(df_model), n_removed),
+  "**Целевая переменная:** Длительность рассмотрения дела (в днях)",
+  "",
+  "## Сравнение моделей",
+  "",
+  "| Модель | R², % | MAE, дней |",
+  "|--------|------:|----------:|",
+  sprintf("| Базовая | %.1f | %.1f |", compare$R2[1], compare$MAE[1]),
+  sprintf("| + n_violations | %.1f | %.1f |", compare$R2[2], compare$MAE[2]),
+  sprintf("| + отдельные паттерны | %.1f | %.1f |", compare$R2[3], compare$MAE[3]),
+  "",
+  "## Качество финальной модели",
+  "",
+  "- **Метод:** Случайный лес (регрессия, 500 деревьев)",
+  sprintf("- **MAE:** %.1f дней", mae),
+  sprintf("- **RMSE:** %.1f дней", rmse),
+  sprintf("- **OOB R²:** %.1f%%", model_rf$rsq[500] * 100),
+  "",
+  "## Важность признаков",
+  "",
+  "| Признак | IncNodePurity |",
+  "|---------|--------------:|",
+  sapply(1:nrow(imp_data), function(i)
+    sprintf("| %s | %.4f |", imp_data$Признак[i], imp_data$IncNodePurity[i])),
+  "",
+  "## Топ-3 признака",
+  sapply(1:nrow(top3), function(i) sprintf("- **%s**", top3$Признак[i])),
+  "",
+  "## Распределение n_violations",
+  "",
+  paste(capture.output(print(table(df_model$n_violations))), collapse = "\n"),
+  "",
+  "## Файлы",
+  "",
+  "- `data/cases_features_clean.csv` — очищенный датасет",
+  "- `data/model_comparison.csv` — сравнение трёх моделей",
+  "- `data/model_duration_importance.csv` — важность признаков"
+)
+
+writeLines(md_lines, file.path(BASE_DIR, "data", "model_duration_report.md"))
+cat("\nОтчёт сохранён.\nМоделирование завершено.\n")
+==> repair_downloads.R <==
+# ============================================================
+# repair_downloads.R
+# Автоматическая проверка и дозагрузка "битых" или отсутствующих файлов
+# МАКСИМАЛЬНО ОПТИМИЗИРОВАННАЯ ВЕРСИЯ (для работы с очень большими файлами)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(chromote)
+  library(stringr)
+  library(jsonlite)
+})
+
+# --------------------- НАСТРОЙКИ ---------------------
+BASE_URL <- "https://xn--90afdbaav0bd1afy6eub5d.xn--p1ai"
+BASE_DIR <- "C:/Users/rewhe/Desktop/videonabludenie"
+
+MIN_FILE_SIZE <- 25000 
+
+ERROR_PATTERNS <- c(
+  "can't reach this page", "не удается получить доступ к сайту", 
+  "hmmm", "err_connection", "err_name_not_resolved", 
+  "502 bad gateway", "504 gateway timeout", "503 service unavailable",
+  "404 not found", "403 forbidden"
+)
+
+# ОПТИМИЗАЦИЯ 1: Компилируем регулярное выражение ОДИН РАЗ при запуске.
+# Это избавляет от необходимости склеивать строки и запускать цикл внутри функции проверки.
+ERROR_REGEX <- paste(ERROR_PATTERNS, collapse = "|")
+
+# Проверка пути к браузеру
+edge_path <- "C:/Program Files/Microsoft/Edge/Application/msedge.exe"
+if (!file.exists(edge_path)) {
+  edge_path <- "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+}
+Sys.setenv(CHROMOTE_CHROME = edge_path)
+
+# --------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------
+
+# Ожидание реальной загрузки контента
+wait_for_real_content <- function(session, max_seconds = 50) { # было 10 или 8
+  for (i in 1:max_seconds) {
+    res <- tryCatch(
+      session$Runtime$evaluate("document.documentElement.outerHTML.length", returnByValue = TRUE),
+      error = function(e) NULL
+    )
+    if (!is.null(res) && !is.null(res$result$value) && res$result$value > 5000) {
+      return(TRUE)
+    }
+    Sys.sleep(1)
+  }
+  return(FALSE)
+}
+
+# Безопасная навигация
+safe_get <- function(session, url, retries = 3) {
+  for (attempt in seq_len(retries)) {
+    ok <- tryCatch({
+      session$Page$navigate(url)
+      Sys.sleep(4) # Больше времени на отклик
+      TRUE
+    }, error = function(e) FALSE)
+    if (ok) return(TRUE)
+    if (attempt < retries) Sys.sleep(3)
+  }
+  FALSE
+}
+is_bad_file <- function(file_path) {
+  f_size <- file.info(file_path)$size
+  if (is.na(f_size) || f_size < MIN_FILE_SIZE) return(TRUE)
+  
+  # Читаем ТОЛЬКО первые 20 строк для быстрой проверки (оптимизация для больших файлов)
+  lines <- tryCatch(
+    readLines(file_path, warn = FALSE, encoding = "UTF-8", n = 20),
+    error = function(e) character(0)
+  )
+  if (length(lines) == 0) return(TRUE)
+  
+  header_text <- tolower(paste(lines, collapse = " "))
+  
+  # 1. ПРОВЕРКА НА СТРАНИЦУ ОШИБКИ БРАУЗЕРА (Chromium/Chrome/Edge)
+  # Эти страницы могут весить сотни КБ, но они являются мусором
+  browser_error_patterns <- c(
+    "err_", "chromium", "no internet", "name not resolved", 
+    "connection refused", "connection reset", "net::err"
+  )
+  for (patt in browser_error_patterns) {
+    if (str_detect(header_text, patt)) return(TRUE)
+  }
+  
+  # 2. ПРОВЕРКА НА КАПЧУ / БЛОКИРОВКУ / АНТИБОТ
+  block_patterns <- c(
+    "cloudflare", "captcha", "проверка браузера", "доступ ограничен",
+    "access denied", "just a moment", "ddos protection"
+  )
+  for (patt in block_patterns) {
+    if (str_detect(header_text, patt)) return(TRUE)
+  }
+  
+  # 3. ПРОВЕРКА НА ПУСТУЮ ОБОЛОЧКУ САЙТА
+  # Если в первых 20 строках нет тега <body>, значит HTML битый или незагруженный
+  if (!str_detect(header_text, "<body")) return(TRUE)
+  
+  # 4. ПРОВЕРКА НА СЛИШКОМ МАЛЕНЬКИЙ ФАЙЛ
+  # Реальное решение суда с таблицами и текстом всегда > 25000 символов
+  if (f_size < 25000) return(TRUE)
+  
+  return(FALSE)
+}
+
+# --------------------- ГЛАВНАЯ ЛОГИКА ---------------------
+main_repair <- function() {
+  cat("=== Запуск проверки и восстановления загрузок ===\n")
+  
+  json_files <- list.files(BASE_DIR, pattern = "^case_ids_.*\\.json$", full.names = TRUE)
+  
+  if (length(json_files) == 0) {
+    cat("Файлы case_ids_*.json не найдены в", BASE_DIR, "\n")
+    return(invisible())
+  }
+  
+  cat(sprintf("Найдено %d файлов со списками ID.\n", length(json_files)))
+  
+  # ОПТИМИЗАЦИЯ 3: Используем списки для накопления результатов, 
+  # чтобы избежать квадратичной деградации скорости при использовании c()
+  ids_to_redownload <- list()
+  districts_for_ids <- list()
+  
+  for (json_file in json_files) {
+    district <- str_extract(basename(json_file), "(?<=case_ids_).*?(?=\\.json)")
+    target_folder <- file.path(BASE_DIR, paste0(district, "_Videonablyudenie_v_skole"))
+    
+    cat(sprintf("\n[Проверка] Округ: %s\n", district))
+    
+    all_ids <- fromJSON(json_file)
+    if (is.list(all_ids)) all_ids <- unlist(all_ids, use.names = FALSE)
+    
+    n_ids <- length(all_ids)
+    cat(sprintf("  Всего ID в файле: %d. Проверка...\n", n_ids))
+    
+    # Векторизованная проверка путей
+    file_paths <- file.path(target_folder, paste0(all_ids, ".html"))
+    exists_mask <- file.exists(file_paths)
+    is_bad <- logical(n_ids)
+    
+    for (j in seq_len(n_ids)) {
+      if (!exists_mask[j]) {
+        is_bad[j] <- TRUE
+      } else {
+        is_bad[j] <- is_bad_file(file_paths[j])
+        if (is_bad[j]) {
+          file.remove(file_paths[j]) # Удаляем битый файл сразу
+        }
+      }
+      
+      # Индикатор прогресса каждые 500 файлов
+      if (j %% 500 == 0) {
+        cat(sprintf("    Проверено: %d / %d\n", j, n_ids))
+      }
+    }
+    
+    missing_count <- sum(!exists_mask)
+    too_small_count <- sum(is_bad & exists_mask)
+    
+    cat(sprintf("  ИТОГО: Проверено: %d | Отсутствует: %d | Битых (удалено): %d\n", 
+                n_ids, missing_count, too_small_count))
+    
+    # Безопасное добавление в список без деградации производительности
+    if (any(is_bad)) {
+      ids_to_redownload <- c(ids_to_redownload, list(all_ids[is_bad]))
+      districts_for_ids <- c(districts_for_ids, list(rep(district, sum(is_bad))))
+    }
+  }
+  
+  # Распаковываем списки в плоские векторы только один раз в конце
+  ids_to_redownload <- unlist(ids_to_redownload, use.names = FALSE)
+  districts_for_ids <- unlist(districts_for_ids, use.names = FALSE)
+  
+  total_to_fix <- length(ids_to_redownload)
+  cat(sprintf("\n=== ИТОГ ПРОВЕРКИ: Найдено %d файлов для перезагрузки ===\n", total_to_fix))
+  
+  if (total_to_fix == 0) {
+    cat("Отлично! Все файлы загружены корректно и имеют достаточный размер.\n")
+    return(invisible())
+  }
+  
+  # 3. Процесс перезагрузки
+  cat("\nЗапуск браузера для дозагрузки...\n")
+  session <- ChromoteSession$new()
+  on.exit(session$close(), add = TRUE)
+  
+  success_count <- 0
+  failed_count <- 0
+  
+  # Предвыделяем память для лога ошибок
+  failed_log <- character(total_to_fix)
+  
+  for (i in seq_len(total_to_fix)) {
+    cid <- ids_to_redownload[i]
+    district <- districts_for_ids[i]
+    url <- paste0(BASE_URL, "/", cid)
+    target_folder <- file.path(BASE_DIR, paste0(district, "_Videonablyudenie_v_skole"))
+    file_path <- file.path(target_folder, paste0(cid, ".html"))
+    
+    dir.create(target_folder, showWarnings = FALSE, recursive = TRUE)
+    
+    cat(sprintf("[%d/%d] ID: %s (%s) ... ", i, total_to_fix, cid, district))
+    
+    if (safe_get(session, url)) {
+      # явно указываем 20 секунд ожидания
+      content_loaded <- wait_for_real_content(session, max_seconds = 50) 
+      
+      if (content_loaded) {
+        res <- tryCatch(
+          session$Runtime$evaluate("document.documentElement.outerHTML", returnByValue = TRUE),
+          error = function(e) list(result = list(value = NULL))
+        )
+        html_content <- res$result$value
+        
+        if (!is.null(html_content)) {
+          # Используем тот же оптимизированный подход с одним regex
+          has_error <- grepl(ERROR_REGEX, html_content, ignore.case = TRUE)
+          
+          if (has_error) {
+            cat("FAIL (Ошибка в контенте)\n")
+            failed_count <- failed_count + 1
+            failed_log[failed_count] <- cid
+          } else if (nchar(html_content) >= MIN_FILE_SIZE) {
+            writeLines(html_content, file_path, useBytes = TRUE)
+            cat("OK (", nchar(html_content), "симв.)\n")
+            success_count <- success_count + 1
+          } else {
+            cat("FAIL (Слишком короткий)\n")
+            failed_count <- failed_count + 1
+            failed_log[failed_count] <- cid
+          }
+        } else {
+          cat("FAIL (Пустой ответ)\n")
+          failed_count <- failed_count + 1
+          failed_log[failed_count] <- cid
+        }
+      } else {
+        cat("FAIL (Таймаут)\n")
+        failed_count <- failed_count + 1
+        failed_log[failed_count] <- cid
+      }
+    } else {
+      cat("FAIL (Ошибка навигации)\n")
+      failed_count <- failed_count + 1
+      failed_log[failed_count] <- cid
+    }
+    
+    Sys.sleep(1.5) # Пауза между запросами
+  }
+  
+  cat("\n=== ОТЧЕТ О ВОССТАНОВЛЕНИИ ===\n")
+  cat(sprintf("Успешно перезагружено: %d файлов\n", success_count))
+  cat(sprintf("Не удалось загрузить: %d файлов\n", failed_count))
+  
+  if (failed_count > 0) {
+    log_file <- file.path(BASE_DIR, "permanently_failed_ids.txt")
+    writeLines(failed_log[1:failed_count], log_file)
+    cat(sprintf("Список окончательно неудачных ID сохранен в: %s\n", log_file))
+  }
+  
+  cat("Процесс завершен.\n")
+}
+
+main_repair()
